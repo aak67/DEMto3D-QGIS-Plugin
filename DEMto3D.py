@@ -106,18 +106,26 @@ class DEMto3D(object):
         raster = False
         if layers:
             for layer in layers:
-                if layer.type() == layer.RasterLayer and QgsProject.instance().layerTreeRoot().findLayer(layer).isVisible():
+                if (layer.type() == layer.RasterLayer and
+                        QgsProject.instance().layerTreeRoot().findLayer(
+                            layer).isVisible()):
                     raster = True
                     break
             if raster and self.window:
                 self.window = False
                 demto3d_dlg = DEMto3D_dialog.DEMto3DDialog(self.iface)
-                demto3d_dlg.exec_()
+                demto3d_dlg.exec()
+                
+                # SICHERS ENTFERNEN FÜR QGIS 4 / QT6:
                 canvas = self.iface.mapCanvas()
-                if demto3d_dlg.extent:
-                    canvas.scene().removeItem(demto3d_dlg.extent)
-                if demto3d_dlg.divisions:
-                    canvas.scene().removeItem(demto3d_dlg.divisions)
+                scene = canvas.scene() if canvas else None
+                
+                if scene:
+                    if getattr(demto3d_dlg, 'extent', None) and demto3d_dlg.extent.scene() == scene:
+                        scene.removeItem(demto3d_dlg.extent)
+                    if getattr(demto3d_dlg, 'divisions', None) and demto3d_dlg.divisions.scene() == scene:
+                        scene.removeItem(demto3d_dlg.divisions)
+                        
                 self.window = True
             elif not raster:
                 QMessageBox.information(self.iface.mainWindow(), "DEMto3D", self.tr("No visible raster layer loaded"))

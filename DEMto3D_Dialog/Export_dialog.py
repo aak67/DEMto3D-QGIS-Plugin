@@ -20,74 +20,105 @@
 """
 
 from __future__ import absolute_import
-import math
 import os
 
-from qgis.PyQt.QtWidgets import QMessageBox
-from qgis.PyQt.QtWidgets import QDialog
+from qgis.PyQt.QtWidgets import QMessageBox, QDialog
+from qgis.core import QgsApplication
 
-from ..model_builder.Model_Builder import Model
-from ..model_builder.STL_Builder import STL
+from ..model_builder.Model_Builder import ModelTask
+from ..model_builder.STL_Builder import STLTask
 
 
 class Export(QDialog):
 
-    Model = None
-    STL = None
-
     def __init__(self, mainDialog, parameters, file_name):
-        QDialog.__init__(self)
+        super(Export, self).__init__()
         self.mainDlg = mainDialog
         self.parameters = parameters
         self.stl_file = file_name
+        self.task = None
+
         self.prepareUi(True)
         self.do_model()
 
     def do_model(self):
-        maxVal = int(math.ceil(self.parameters["height"] / self.parameters["spacing_mm"]) + 1)
-        self.mainDlg.ui.progressBar.setMaximum(maxVal)
+        print("[DEMto3D] Starte ModelTask...")
+        self.mainDlg.ui.progressBar.setMaximum(100)
         self.mainDlg.ui.progressBar.setValue(0)
-        self.mainDlg.ui.cancelProgressToolButton.clicked.connect(self.cancel_model)
+
+        self._disconnect_cancel_button()
+        self.mainDlg.ui.cancelProgressToolButton.clicked.connect(self.cancel_task)
         self.mainDlg.ui.ProgressLabel.setText(self.tr("Building STL geometry"))
 
-        self.Model = Model(self.parameters)
-        self.Model.updateProgress.connect(lambda: self.mainDlg.ui.progressBar.setValue(self.mainDlg.ui.progressBar.value() + 1))
-        self.Model.finished.connect(self.do_stl_model)
-        self.Model.start()
+        try:
+            self.task = ModelTask(self.parameters)
+            
+            self.task.progressChanged.connect(self.on_progress)
+            self.task.taskCompleted.connect(self.do_stl_file)
+            self.task.taskTerminated.connect(self.on_task_failed)
 
-    def cancel_model(self):
-        self.Model.quit = True
+            task_id = QgsApplication.taskManager().addTask(self.task)
+            print(f"[DEMto3D] Task gestartet mit ID: {task_id}")
 
-    def do_stl_model(self):
-        self.mainDlg.ui.progressBar.setValue(0)
-        if self.Model.quit:
-            self.prepareUi(False)
-            QMessageBox.information(self.mainDlg, self.mainDlg.tr("Attention"), self.mainDlg.tr("Process cancelled"))
-        else:
-            self.mainDlg.ui.cancelProgressToolButton.clicked.connect(self.cancel_stl_model)
-            self.mainDlg.ui.ProgressLabel.setText(self.tr("Creating STL file"))
-            dem_matrix = self.Model.get_model()
-            rows = dem_matrix.__len__()
-            cols = dem_matrix[0].__len__()
-            maxVal = rows * cols * 2
-            self.mainDlg.ui.progressBar.setMaximum(maxVal)
+        except Exception as e:
+            print(f"[DEMto3D] Fehler beim Erstellen des ModelTasks: {e}")
+            self.on_task_failed()
 
-            self.STL = STL(self.parameters, self.stl_file, dem_matrix)
-            self.STL.updateProgress.connect(lambda: self.mainDlg.ui.progressBar.setValue(self.mainDlg.ui.progressBar.value() + 1))
-            self.STL.finished.connect(self.finish_model)
-            self.STL.start()
+    def do_stl_file(self):
+        print("[DEMto3D] ModelTask abgeschlossen. Starte STLTask...")
+        self.mainDlg.ui.ProgressLabel.setText(self.tr("Exporting STL file"))
 
-    def cancel_stl_model(self):
-        self.STL.quit = True
+        matrix_dem = getattr(self.task, "matrix_dem", None)
 
-    def finish_model(self):
+        try:
+            self.task = STLTask(self.parameters, self.stl_file, matrix_dem)
+
+            self.task.progressChanged.connect(self.on_progress)
+            # Hier lag der Fehler: finish_export statt on_task_finished
+            self.task.taskCompleted.connect(self.finish_export)
+            self.task.taskTerminated.connect(self.on_task_failed)
+
+            task_id = QgsApplication.taskManager().addTask(self.task)
+            print(f"[DEMto3D] STLTask gestartet mit ID: {task_id}")
+
+        except Exception as e:
+            print(f"[DEMto3D] Fehler beim Erstellen des STLTasks: {e}")
+            self.on_task_failed()
+
+    def on_progress(self, progress):
+        self.mainDlg.ui.progressBar.setValue(int(progress))
+
+    def cancel_task(self):
+        if self.task:
+            print("[DEMto3D] Task wird abgebrochen...")
+            self.task.cancel()
+
+    def finish_export(self):
+        print("[DEMto3D] Export erfolgreich beendet.")
+        self._disconnect_cancel_button()
+        self.prepareUi(False)
+        self.mainDlg.ui.progressBar.setValue(100)
+        QMessageBox.information(self.mainDlg, self.mainDlg.tr("Attention"), self.mainDlg.tr("STL model generated"))
+
+    def on_task_failed(self, *args):
+        print("[DEMto3D] Task fehlgeschlagen oder abgebrochen.")
+        # Hier lag der zweite Fehler: _disconnect_cancel_button statt _restore_cancel_button
+        self._disconnect_cancel_button()
+        self.mainDlg.ui.ProgressLabel.setText(self.tr("Export failed"))
         self.prepareUi(False)
         self.mainDlg.ui.progressBar.setValue(0)
-        if self.STL.quit:
-            os.remove(self.stl_file)
-            QMessageBox.information(self.mainDlg, self.mainDlg.tr("Attention"), self.mainDlg.tr("Process cancelled"))
-        else:
-            QMessageBox.information(self.mainDlg, self.mainDlg.tr("Attention"), self.mainDlg.tr("STL model generated"))
+        if os.path.exists(self.stl_file):
+            try:
+                os.remove(self.stl_file)
+            except OSError:
+                pass
+        QMessageBox.information(self.mainDlg, self.mainDlg.tr("Attention"), self.mainDlg.tr("Process cancelled or failed"))
+
+    def _disconnect_cancel_button(self):
+        try:
+            self.mainDlg.ui.cancelProgressToolButton.clicked.disconnect()
+        except (TypeError, RuntimeError):
+            pass
 
     def prepareUi(self, start):
         if start:
@@ -101,5 +132,9 @@ class Export(QDialog):
         self.mainDlg.ui.groupBox_5.setEnabled(not start)
         self.mainDlg.ui.ParamPushButton.setEnabled(not start)
         self.mainDlg.ui.STLToolButton.setEnabled(not start)
-        self.mainDlg.ui.ParamPushButton.setEnabled(not start)
         self.mainDlg.ui.CancelToolButton.setEnabled(not start)
+
+    def closeEvent(self, event):
+        if self.task:
+            self.task.cancel()
+        event.accept()
