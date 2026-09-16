@@ -5,7 +5,7 @@
                                  A QGIS plugin
  Description
                              -------------------
-        copyright            : (C) 2022 by Javier
+        copyright            : (C) 2026 by Javier
         email                : demto3d@gmail.com
  ***************************************************************************/
 
@@ -58,7 +58,7 @@ class Export(QDialog):
             self.task.taskTerminated.connect(self.on_task_failed)
 
             task_id = QgsApplication.taskManager().addTask(self.task)
-            print(f"[DEMto3D] Task gestartet mit ID: {task_id}")
+            print(f"[DEMto3D] ModelTask gestartet mit ID: {task_id}")
 
         except Exception as e:
             print(f"[DEMto3D] Fehler beim Erstellen des ModelTasks: {e}")
@@ -66,15 +66,33 @@ class Export(QDialog):
 
     def do_stl_file(self):
         print("[DEMto3D] ModelTask abgeschlossen. Starte STLTask...")
-        self.mainDlg.ui.ProgressLabel.setText(self.tr("Exporting STL file"))
 
+        # 1. Matrix aus dem beendeten ModelTask auslesen
         matrix_dem = getattr(self.task, "matrix_dem", None)
 
+        # 2. Validierung: Prüfen, ob wirklich Höhendaten vorhanden sind
+        if not matrix_dem or len(matrix_dem) == 0:
+            print("[DEMto3D] Fehler: Matrix ist leer oder None.")
+            QMessageBox.warning(
+                self.mainDlg,
+                self.tr("Fehler"),
+                self.tr("Keine Geometriedaten im ausgewählten Bereich gefunden.")
+            )
+            self.prepareUi(False)
+            return
+
+        # 3. UI-Anzeige & Abbrechen-Button für den neuen Task konfigurieren
+        self.mainDlg.ui.ProgressLabel.setText(self.tr("Creating STL file"))
+        self.mainDlg.ui.progressBar.setValue(0)
+
+        self._disconnect_cancel_button()
+        self.mainDlg.ui.cancelProgressToolButton.clicked.connect(self.cancel_task)
+
+        # 4. STLTask instanziieren und an QgsTaskManager übergeben
         try:
             self.task = STLTask(self.parameters, self.stl_file, matrix_dem)
 
             self.task.progressChanged.connect(self.on_progress)
-            # Hier lag der Fehler: finish_export statt on_task_finished
             self.task.taskCompleted.connect(self.finish_export)
             self.task.taskTerminated.connect(self.on_task_failed)
 
@@ -86,6 +104,7 @@ class Export(QDialog):
             self.on_task_failed()
 
     def on_progress(self, progress):
+        # Aktualisiert die Fortschrittsanzeige kontinuierlich (0 - 100 %)
         self.mainDlg.ui.progressBar.setValue(int(progress))
 
     def cancel_task(self):
@@ -102,7 +121,6 @@ class Export(QDialog):
 
     def on_task_failed(self, *args):
         print("[DEMto3D] Task fehlgeschlagen oder abgebrochen.")
-        # Hier lag der zweite Fehler: _disconnect_cancel_button statt _restore_cancel_button
         self._disconnect_cancel_button()
         self.mainDlg.ui.ProgressLabel.setText(self.tr("Export failed"))
         self.prepareUi(False)

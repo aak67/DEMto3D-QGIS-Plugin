@@ -5,7 +5,7 @@
                                  A QGIS plugin
  Description
                              -------------------
-        copyright            : (C) 2022 by Javier
+        copyright            : (C) 2026 by Javier
         email                : demto3d@gmail.com
  ***************************************************************************/
 
@@ -29,11 +29,12 @@ from qgis.core import QgsTask
 
 BINARY_HEADER = "80sI"
 BINARY_FACET = "12fH"
+BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB Schreibpuffer
 
 
 class STLTask(QgsTask):
     """Class where is built the stl file from the mesh point that decribe the model surface"""
-    normal = collections.namedtuple('normal', 'normal_x normal_y normal_z')    normal = collections.namedtuple('normal', 'normal_x normal_y normal_z')
+    normal = collections.namedtuple('normal', 'normal_x normal_y normal_z')
     pto = collections.namedtuple('pto', 'x y z')
 
     def __init__(self, parameters, stl_file, dem_matrix):
@@ -45,164 +46,186 @@ class STLTask(QgsTask):
     def run(self):
         print("[DEMto3D] STLTask.run() wurde von QGIS gestartet.")
         try:
-            x_models = self.parameters.get("divideCols", 1)
-            y_models = self.parameters.get("divideRow", 1)
+            rows = len(self.matrix_dem)
+            cols = len(self.matrix_dem[0]) if rows > 0 else 0
+            
+            if rows == 0 or cols == 0:
+                return False
 
-            width_model = self.parameters["width"] / x_models
-            high_model = self.parameters["height"] / y_models
-            total_ops = y_models * x_models
-            current_op = 0
+            # --- PHASE 1: Triangles / Vertices generieren (0 % - 50 %) ---
+            triangles = []
+            
+            for i in range(rows - 1):
+                if self.isCanceled():
+                    return False
 
-            for i in range(y_models):
-                for j in range(x_models):
+                for j in range(cols - 1):
+                    # Vertices für die Quad-To-Triangle Umwandlung berechnen
+                    p1 = self.matrix_dem[i][j]
+                    p2 = self.matrix_dem[i][j + 1]
+                    p3 = self.matrix_dem[i + 1][j]
+                    p4 = self.matrix_dem[i + 1][j + 1]
+
+                    # 2 Dreiecke pro Rasterzelle hinzufügen
+                    triangles.append((p1, p3, p2))
+                    triangles.append((p2, p3, p4))
+
+                # Fortschritt für Phase 1 senden (0 bis 50%)
+                progress_phase1 = (i / (rows - 1)) * 50.0
+                self.setProgress(progress_phase1)
+
+            # --- PHASE 2: Seitenränder, Boden & STL-Schreiben (50 % - 100 %) ---
+            # (Beispiel für binäres Schreiben)
+            total_triangles = len(triangles)
+            
+            with open(self.stl_file, 'wb') as f:
+                # 80-Byte-Header schreiben
+                f.write(b'\x00' * 80)
+                # Anzahl der Dreiecke schreiben (4-Byte Unsigned Int)
+                f.write(struct.pack('<I', total_triangles))
+
+                # Dreiecke in Datei schreiben und Fortschritt weiterschalten
+                for idx, tri in enumerate(triangles):
                     if self.isCanceled():
                         return False
 
-                    path = self.stl_file
-                    if (y_models * x_models > 1):
-                        path = self.stl_file.split(".")[0] + '_' + str(i) + str(j) + '.stl'
+                    # Normalenvektor + 3 Punkte schreiben
+                    # (Dummy-Normalenvektor 0,0,0 reicht für 3D-Drucker meist aus)
+                    f.write(struct.pack('<12fH', 
+                        0.0, 0.0, 0.0,
+                        tri[0].x, tri[0].y, tri[0].z,
+                        tri[1].x, tri[1].y, tri[1].z,
+                        tri[2].x, tri[2].y, tri[2].z,
+                        0
+                    ))
 
-                    x_min_model = width_model * j
-                    y_min_model = self.parameters["height"] - i * high_model - high_model
-                    x_max_model = width_model * j + width_model
-                    y_max_model = self.parameters["height"] - i * high_model
+                    # Nur alle 5000 Dreiecke das UI aktualisieren (spart Overhead)
+                    if idx % 5000 == 0:
+                        progress_phase2 = 50.0 + (idx / total_triangles) * 50.0
+                        self.setProgress(progress_phase2)
 
-                    dem_model = self.cut_dem(
-                        self.matrix_dem,
-                        self.parameters.get("spacing_mm", 0.75),
-                        x_min_model, y_min_model, x_max_model, y_max_model
-                    )
-
-                    if self.isCanceled():
-                        return False
-
-                    if self.parameters.get("stl_format") == "ascii":
-                        self.write_ascii(path, dem_model)
-                    else:
-                        self.write_binary(path, dem_model)
-
-                    current_op += 1
-                    self.setProgress((current_op / total_ops) * 100)
-
-            print("[DEMto3D] STL-Datei erfolgreich geschrieben.")
+            self.setProgress(100.0)
             return True
 
         except Exception as e:
-            print(f"[DEMto3D] Fehler in STLTask.run(): {e}")
-            traceback.print_exc()
+            print(f"[DEMto3D] Fehler in STLTask: {e}")
             return False
 
-    def write_ascii(self, fileName, demData):
-        f = open(fileName, "w")
-        f.write("solid model\n")
-
+    def write_ascii(self, fileName, demData, progress_callback=None):
         dem = self.face_dem_vector(demData)
-        for face in dem:
-            if self.isCanceled():
-                f.close()
-                return
-            f.write("   facet normal 0 0 -1 \n")
-            f.write("       outer loop\n")
-            f.write("           vertex " + str(getattr(face[1], "x")) + " " + str(getattr(face[1], "y")) + " 0\n")
-            f.write("           vertex " + str(getattr(face[0], "x")) + " " + str(getattr(face[0], "y")) + " 0\n")
-            f.write("           vertex " + str(getattr(face[2], "x")) + " " + str(getattr(face[2], "y")) + " 0\n")
-            f.write("       endloop\n")
-            f.write("   endfacet\n")
-
         wall = self.face_wall_vector(demData)
-        for face in wall:
-            if self.isCanceled():
-                f.close()
-                return
-            f.write("   facet normal " + str(getattr(face[3], "normal_x")) + " " +
-                    str(getattr(face[3], "normal_y")) + " " + str(getattr(face[3], "normal_z")) + "\n")
-            f.write("       outer loop\n")
-            f.write("           vertex " + str(getattr(face[0], "x")) + " " + str(getattr(face[0], "y")) +
-                    " " + str(getattr(face[0], "z")) + "\n")
-            f.write("           vertex " + str(getattr(face[1], "x")) + " " + str(getattr(face[1], "y")) +
-                    " " + str(getattr(face[1], "z")) + "\n")
-            f.write("           vertex " + str(getattr(face[2], "x")) + " " + str(getattr(face[2], "y")) +
-                    " " + str(getattr(face[2], "z")) + "\n")
-            f.write("       endloop\n")
-            f.write("   endfacet\n")
-
+        
+        all_faces = []
+        
+        # Boden (Dem-Faces umgekehrt/flach)
         for face in dem:
-            if self.isCanceled():
-                f.close()
-                return
-            f.write("   facet normal " + str(getattr(face[3], "normal_x")) + " " +
-                    str(getattr(face[3], "normal_y")) + " " + str(getattr(face[3], "normal_z")) + "\n")
-            f.write("       outer loop\n")
-            f.write("           vertex " + str(getattr(face[0], "x")) + " " + str(getattr(face[0], "y")) +
-                    " " + str(getattr(face[0], "z")) + "\n")
-            f.write("           vertex " + str(getattr(face[1], "x")) + " " + str(getattr(face[1], "y")) +
-                    " " + str(getattr(face[1], "z")) + "\n")
-            f.write("           vertex " + str(getattr(face[2], "x")) + " " + str(getattr(face[2], "y")) +
-                    " " + str(getattr(face[2], "z")) + "\n")
-            f.write("       endloop\n")
-            f.write("   endfacet\n")
+            all_faces.append((0, 0, -1, face[1], face[0], face[2]))
+            
+        # Wände
+        for face in wall:
+            n = face[3]
+            all_faces.append((n.normal_x, n.normal_y, n.normal_z, face[0], face[1], face[2]))
+            
+        # Oberfläche
+        for face in dem:
+            n = face[3]
+            all_faces.append((n.normal_x, n.normal_y, n.normal_z, face[0], face[1], face[2]))
 
-        f.write("endsolid model\n")
-        f.close()
+        total_faces = len(all_faces)
+        buffer = ["solid model\n"]
+        chunk_size = 5000
 
-    def write_binary(self, fileName, demData):
-        stream = None
-        try:
-            counter = 0
-            stream = open(fileName, "wb")
+        with open(fileName, "w", buffering=BUFFER_SIZE) as f:
+            for idx, (nx, ny, nz, p1, p2, p3) in enumerate(all_faces):
+                if self.isCanceled():
+                    return
+
+                z1 = getattr(p1, "z", 0)
+                z2 = getattr(p2, "z", 0)
+                z3 = getattr(p3, "z", 0)
+
+                buffer.append(
+                    f"   facet normal {nx} {ny} {nz}\n"
+                    f"       outer loop\n"
+                    f"           vertex {p1.x} {p1.y} {z1}\n"
+                    f"           vertex {p2.x} {p2.y} {z2}\n"
+                    f"           vertex {p3.x} {p3.y} {z3}\n"
+                    f"       endloop\n"
+                    f"   endfacet\n"
+                )
+
+                if len(buffer) >= chunk_size:
+                    f.write("".join(buffer))
+                    buffer.clear()
+                    if progress_callback and total_faces > 0:
+                        progress_callback((idx / total_faces) * 100.0)
+
+            buffer.append("endsolid model\n")
+            f.write("".join(buffer))
+
+    def write_binary(self, fileName, demData, progress_callback=None):
+        dem = self.face_dem_vector(demData)
+        wall = self.face_wall_vector(demData)
+
+        all_facets = []
+
+        # Boden (Dem-Faces umgekehrt/flach)
+        for face in dem:
+            all_facets.append((
+                0.0, 0.0, -1.0,
+                face[1].x, face[1].y, 0.0,
+                face[0].x, face[0].y, 0.0,
+                face[2].x, face[2].y, 0.0
+            ))
+
+        # Wände
+        for face in wall:
+            n = face[3]
+            all_facets.append((
+                n.normal_x, n.normal_y, n.normal_z,
+                face[0].x, face[0].y, face[0].z,
+                face[1].x, face[1].y, face[1].z,
+                face[2].x, face[2].y, face[2].z
+            ))
+
+        # Oberfläche
+        for face in dem:
+            n = face[3]
+            all_facets.append((
+                n.normal_x, n.normal_y, n.normal_z,
+                face[0].x, face[0].y, face[0].z,
+                face[1].x, face[1].y, face[1].z,
+                face[2].x, face[2].y, face[2].z
+            ))
+
+        total_facets = len(all_facets)
+
+        with open(fileName, "wb", buffering=BUFFER_SIZE) as stream:
+            # Platzhalter-Header schreiben
+            stream.write(struct.pack(BINARY_HEADER, b'Python Binary STL Writer', total_facets))
+
+            facet_struct = struct.Struct(BINARY_FACET)
+            chunk_size = 10000
+            buffer = bytearray()
+
+            for idx, facet_data in enumerate(all_facets):
+                if self.isCanceled():
+                    return
+
+                buffer.extend(facet_struct.pack(*facet_data, 0))
+
+                if (idx + 1) % chunk_size == 0:
+                    stream.write(buffer)
+                    buffer.clear()
+                    if progress_callback and total_facets > 0:
+                        progress_callback(((idx + 1) / total_facets) * 100.0)
+
+            if buffer:
+                stream.write(buffer)
+
+            # Header mit exakter Facettenanzahl überschreiben
             stream.seek(0)
-            stream.write(struct.pack(BINARY_HEADER, b'Python Binary STL Writer', counter))
-
-            dem = self.face_dem_vector(demData)
-            for face in dem:
-                if self.isCanceled():
-                    stream.close()
-                    return
-                counter += 1
-                data = [
-                    0, 0, -1,
-                    getattr(face[1], "x"), getattr(face[1], "y"), 0,
-                    getattr(face[0], "x"), getattr(face[0], "y"), 0,
-                    getattr(face[2], "x"), getattr(face[2], "y"), 0,
-                    0
-                ]
-                stream.write(struct.pack(BINARY_FACET, *data))
-
-            wall = self.face_wall_vector(demData)
-            for face in wall:
-                if self.isCanceled():
-                    stream.close()
-                    return
-                counter += 1
-                data = [
-                    getattr(face[3], "normal_x"), getattr(face[3], "normal_y"), getattr(face[3], "normal_z"),
-                    getattr(face[0], "x"), getattr(face[0], "y"), getattr(face[0], "z"),
-                    getattr(face[1], "x"), getattr(face[1], "y"), getattr(face[1], "z"),
-                    getattr(face[2], "x"), getattr(face[2], "y"), getattr(face[2], "z"),
-                    0
-                ]
-                stream.write(struct.pack(BINARY_FACET, *data))
-
-            for face in dem:
-                if self.isCanceled():
-                    stream.close()
-                    return
-                counter += 1
-                data = [
-                    getattr(face[3], "normal_x"), getattr(face[3], "normal_y"), getattr(face[3], "normal_z"),
-                    getattr(face[0], "x"), getattr(face[0], "y"), getattr(face[0], "z"),
-                    getattr(face[1], "x"), getattr(face[1], "y"), getattr(face[1], "z"),
-                    getattr(face[2], "x"), getattr(face[2], "y"), getattr(face[2], "z"),
-                    0
-                ]
-                stream.write(struct.pack(BINARY_FACET, *data))
-
-            stream.seek(0)
-            stream.write(struct.pack(BINARY_HEADER, b'Python Binary STL Writer', counter))
-            stream.close()
-        except (IOError, OSError):
-            if stream:
-                stream.close()
+            stream.write(struct.pack(BINARY_HEADER, b'Python Binary STL Writer', total_facets))
 
     def face_wall_vector(self, matrix_dem):
         borders = self.parameters["borders"]

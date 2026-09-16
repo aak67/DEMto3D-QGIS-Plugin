@@ -8,3 +8,14 @@
 resourcesCompile.bat
 
 .gitignore
+
+# Python Cache & Bytecode
+*.pyc
+*.pyo
+*.pyd
+*.bak
+*.sqlite
+.idea/
+.vscode/
+# Build & STL Output
+*.stl

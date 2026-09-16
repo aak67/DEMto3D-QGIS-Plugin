@@ -5,7 +5,7 @@
                                  A QGIS plugin
  Description
                              -------------------
-        copyright            : (C) 2022 by Javier
+        copyright            : (C) 2026 by Javier
         email                : demto3d@gmail.com
  ***************************************************************************/
 
@@ -32,7 +32,7 @@ class ModelTask(QgsTask):
     pto = collections.namedtuple('pto', 'x y z')
 
     def __init__(self, parameters):
-        # QgsTask verlangt in PyQGIS den Namen und die Flags:
+        # QgsTask verlangt den Namen und die Flags
         super().__init__("DEMto3D Model Building", QgsTask.CanCancel)
         self.parameters = parameters
         self.matrix_dem = []
@@ -41,27 +41,109 @@ class ModelTask(QgsTask):
     def run(self):
         print("[DEMto3D] ModelTask.run() wurde von QGIS gestartet.")
         try:
-            layer_path = self.parameters["layer"]
-            # Falls layer ein QgsRasterLayer-Objekt ist, den Dateipfad holen
-            if hasattr(layer_path, 'source'):
-                layer_path = layer_path.source()
+            # 1. Layer-Objekt ermitteln
+            layer_param = self.parameters["layer"]
+            layer = None
 
-            dem_dataset = gdal.Open(layer_path)
-            if not dem_dataset:
-                print(f"[DEMto3D] Fehler: GDAL konnte Datei nicht öffnen: {layer_path}")
+            if isinstance(layer_param, str):
+                layers = QgsProject.instance().mapLayersByName(layer_param)
+                if layers:
+                    layer = layers[0]
+                else:
+                    all_layers = QgsProject.instance().mapLayers().values()
+                    layer = next((l for l in all_layers if l.source() == layer_param), None)
+            else:
+                layer = layer_param
+
+            if not layer:
+                print(f"[DEMto3D] Fehler: Rasterlayer '{layer_param}' nicht gefunden.")
                 return False
 
-            self.matrix_dem = self.matrix_dem_builder(dem_dataset)
-            dem_dataset = None
+            # --- CRS-Anpassung ---
+            # Quell-CRS (Raster) und Ziel-CRS (Projekt) abfragen
+            src_crs_wkt = layer.crs().toWkt()
+            project_crs = QgsProject.instance().crs()
+            dst_crs_wkt = project_crs.toWkt()
 
-            if self.isCanceled():
-                print("[DEMto3D] ModelTask wurde während der Berechnung abgebrochen.")
+            source_path = layer.source()
+
+            # 2. Parameter auslesen
+            width_mm = self.parameters["width"]
+            height_mm = self.parameters["height"]
+            spacing_mm = self.parameters["spacing_mm"]
+            scale = self.parameters["scale"]
+            z_scale = self.parameters["z_scale"]
+            h_base = self.parameters["z_base"]
+            base_model = self.parameters["baseModel"]
+
+            p = self.parameters
+            roi_bounds = [
+                p["roi_x_min"],
+                p["roi_y_min"],
+                p["roi_x_max"],
+                p["roi_y_max"]
+            ]
+
+            # Schrittweite in Karteneinheiten berechnen (Projekt-Einheiten)
+            spacing_map_units = (spacing_mm * scale) / 1000.0
+
+            # 3. Multi-threaded GDAL Warp mit automatischer Reprojektion ins Projekt-CRS
+            warp_options = gdal.WarpOptions(
+                format='MEM',
+                outputBounds=roi_bounds,
+                xRes=spacing_map_units,
+                yRes=spacing_map_units,
+                srcSRS=src_crs_wkt,         # Explizit Quell-CRS definieren
+                dstSRS=dst_crs_wkt,         # Auf Projekt-CRS reprojizieren
+                resampleAlg=gdal.GRA_CubicSpline,
+                multithread=True,
+                warpOptions=['NUM_THREADS=ALL_CPUS']
+            )
+
+            ds = gdal.Warp('', source_path, options=warp_options)
+            if not ds:
+                print("[DEMto3D] GDAL Warp konnte kein Dataset erstellen.")
                 return False
 
+            band = ds.GetRasterBand(1)
+            raw_matrix = band.ReadAsArray()
+            nodata_val = band.GetNoDataValue()
+            ds = None  # Speicher freigeben
+
+            if self.isCanceled() or raw_matrix is None:
+                return False
+
+            # 4. Matrix verarbeiten
+            rows, cols = raw_matrix.shape
+            self.matrix_dem = []
+
+            for i in range(rows):
+                if self.isCanceled():
+                    return False
+
+                row_list = []
+                y_model = round(height_mm - (i * spacing_mm), 2)
+
+                for j in range(cols):
+                    val = float(raw_matrix[i, j])
+
+                    # Ungültige Werte / NoData / Werte unter der Basis abfangen
+                    if (nodata_val is not None and val == nodata_val) or math.isnan(val) or val <= h_base:
+                        z_val = base_model
+                    else:
+                        z_val = round((val - h_base) / scale * 1000.0 * z_scale, 2) + base_model
+
+                    x_model = round(j * spacing_mm, 2)
+                    row_list.append(self.pto(x=x_model, y=y_model, z=z_val))
+
+                self.matrix_dem.append(row_list)
+                self.setProgress((i / rows) * 100)
+
+            # Optionale Umkehrung verarbeiten, falls gefordert
             if self.parameters.get("z_inv") and self.matrix_dem:
                 self.matrix_dem = self.matrix_dem_inverse_build(self.matrix_dem)
 
-            print(f"[DEMto3D] ModelTask erfolgreich beendet. Punkte berechnet: {len(self.matrix_dem)}")
+            print(f"[DEMto3D] ModelTask erfolgreich beendet. Matrix-Größe: {rows}x{cols}")
             return True
 
         except Exception as e:
